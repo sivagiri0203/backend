@@ -47,6 +47,11 @@ const bookingSchema = new mongoose.Schema(
     seats: { type: [String], default: [] },
     cabinClass: { type: String, enum: ["economy", "premium", "business", "first"], default: "economy" },
 
+     addOns: {
+    extraLegroom: { type: Boolean, default: false },
+    extraLuggageKg: { type: Number, default: 0 },
+},
+
     amount: { type: Number, required: true }, // INR (major units)
     currency: { type: String, default: "INR" },
 
