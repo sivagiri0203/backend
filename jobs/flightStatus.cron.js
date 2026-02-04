@@ -1,59 +1,82 @@
 import cron from "node-cron";
-import Booking from "../models/Booking.js";
 import FlightStatus from "../models/FlightStatus.js";
-import { aviationstackFlights } from "../config/aviationstack.js";
+
+const CRON_EXPR = process.env.FLIGHT_STATUS_CRON || "*/10 * * * *";
 
 /**
- * Updates flight status for PAID + CONFIRMED bookings.
- * Uses /v1/flights with flight_iata filter (and optional date). :contentReference[oaicite:8]{index=8}
+ * Uses Amadeus Flight Status endpoint:
+ * GET /v2/schedule/flights?carrierCode=AI&flightNumber=202&scheduledDepartureDate=2026-02-11
  */
+async function amadeusGetFlightStatus({ carrierCode, flightNumber, date }) {
+  const { getAmadeusClient } = await import("../config/amadeus.js");
+  const amadeus = await getAmadeusClient();
+
+  const res = await amadeus.get("/v2/schedule/flights", {
+    carrierCode,
+    flightNumber,
+    scheduledDepartureDate: date, // YYYY-MM-DD
+  });
+
+  return res?.data || null;
+}
+
+function splitCarrierAndNumber(flightIataOrNumber = "") {
+  // AI202 -> carrierCode=AI, flightNumber=202
+  const clean = String(flightIataOrNumber).trim().toUpperCase();
+  const match = clean.match(/^([A-Z0-9]{2,3})(\d{1,4})$/);
+  if (!match) return null;
+  return { carrierCode: match[1], flightNumber: match[2] };
+}
+
 export function startFlightStatusCron() {
-  const schedule = process.env.FLIGHT_STATUS_CRON || "*/10 * * * *";
-
-  cron.schedule(schedule, async () => {
+  cron.schedule(CRON_EXPR, async () => {
     try {
-      const bookings = await Booking.find({
-        bookingStatus: "confirmed",
-        paymentStatus: "paid"
-      }).limit(50);
+      console.log("⏱️ Flight status cron (Amadeus): running...");
 
-      for (const b of bookings) {
-        const flightIata = b.flight.flightIata;
-        if (!flightIata) continue;
+      const trackers = await FlightStatus.find({}).limit(50);
 
-        const params = { flight_iata: flightIata, limit: 5 };
-        // optional: use flight_date if you store it (b.flight.raw?.flight_date)
-        if (b.flight.raw?.flight_date) params.flight_date = b.flight.raw.flight_date;
+      for (const t of trackers) {
+        // we stored flightIata or flightNumber in DB earlier
+        const parsed =
+          splitCarrierAndNumber(t.flightIata) ||
+          splitCarrierAndNumber(t.flightNumber);
 
-        const apiData = await aviationstackFlights(params);
-        const first = Array.isArray(apiData?.data) ? apiData.data[0] : null;
+        if (!parsed) continue;
 
-        if (!first) continue;
+        // if you stored booking date inside tracker, use that.
+        // else fallback to today
+        const date =
+          (t.scheduledDepartureDate &&
+            String(t.scheduledDepartureDate).slice(0, 10)) ||
+          new Date().toISOString().slice(0, 10);
 
-        const status = first?.flight_status || "unknown";
+        const data = await amadeusGetFlightStatus({
+          carrierCode: parsed.carrierCode,
+          flightNumber: parsed.flightNumber,
+          date,
+        });
 
-        await FlightStatus.findOneAndUpdate(
-          { booking: b._id },
-          {
-            booking: b._id,
-            flightIata,
-            lastStatus: status,
-            lastPayload: first,
-            lastCheckedAt: new Date()
-          },
-          { upsert: true, new: true }
-        );
+        // store full response
+        t.lastPayload = data;
+        t.lastCheckedAt = new Date();
 
-        // keep booking.flight.status updated too
-        b.flight.status = status;
-        await b.save();
+        // you can store a simple status summary
+        // depending on response shape
+        t.lastStatus =
+          data?.data?.[0]?.flightPoints?.[0]?.departure?.timings?.[0]?.qualifier ||
+          "updated";
+
+        await t.save();
       }
 
-      console.log("⏱️ Flight status cron: updated");
+      console.log("✅ Flight status cron (Amadeus): updated", trackers.length);
     } catch (err) {
-      console.error("❌ Flight status cron error:", err?.message || err);
+      console.error(
+        "❌ Flight status cron (Amadeus) error:",
+        err?.response?.data || err.message
+      );
     }
   });
 
-  console.log(`✅ Flight status cron scheduled: ${schedule}`);
+  console.log("✅ Flight status cron scheduled:", CRON_EXPR);
 }

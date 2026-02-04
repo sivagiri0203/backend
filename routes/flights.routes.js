@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { getFlightStatus, searchFlights } from "../controllers/flights.controller.js";
+import { searchFlights, getFlightStatus } from "../controllers/flights.controller.js";
 
 const router = Router();
 

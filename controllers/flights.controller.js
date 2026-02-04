@@ -1,168 +1,127 @@
 import crypto from "crypto";
-import FlightCache from "../models/FlightCache.js";
-import { aviationstackFlights } from "../config/aviationstack.js";
 import { bad, ok } from "../utils/response.js";
+import { getAmadeusClient } from "../config/amadeus.js";
 
-// create a stable cache key from query
+// cache in memory (simple) — optional
+const memCache = new Map();
+const TTL = 5 * 60 * 1000;
+
 function makeKey(obj) {
   const json = JSON.stringify(obj, Object.keys(obj).sort());
   return crypto.createHash("sha256").update(json).digest("hex");
 }
 
-// Normalize AviationStack response into your app-friendly shape
-function normalizeFlights(apiData) {
-  const rows = Array.isArray(apiData?.data) ? apiData.data : [];
+function setCache(key, value) {
+  memCache.set(key, { value, exp: Date.now() + TTL });
+}
 
-  return rows.map((f) => ({
-    provider: "aviationstack",
-    flight_date: f?.flight_date,
-    flight_status: f?.flight_status,
-
-    airline: {
-      name: f?.airline?.name,
-      iata: f?.airline?.iata,
-      icao: f?.airline?.icao
-    },
-
-    flight: {
-      number: f?.flight?.number,
-      iata: f?.flight?.iata,
-      icao: f?.flight?.icao
-    },
-
-    departure: {
-      airport: f?.departure?.airport,
-      iata: f?.departure?.iata,
-      icao: f?.departure?.icao,
-      scheduled: f?.departure?.scheduled,
-      estimated: f?.departure?.estimated,
-      terminal: f?.departure?.terminal,
-      gate: f?.departure?.gate
-    },
-
-    arrival: {
-      airport: f?.arrival?.airport,
-      iata: f?.arrival?.iata,
-      icao: f?.arrival?.icao,
-      scheduled: f?.arrival?.scheduled,
-      estimated: f?.arrival?.estimated,
-      terminal: f?.arrival?.terminal,
-      gate: f?.arrival?.gate
-    },
-
-    live: f?.live || null,
-    raw: f
-  }));
+function getCache(key) {
+  const hit = memCache.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.exp) {
+    memCache.delete(key);
+    return null;
+  }
+  return hit.value;
 }
 
 /**
- * GET /api/flights/search?depIata=MAA&arrIata=DEL&date=2026-02-10&limit=50
- * AviationStack expects access_key + optional filters. flight_date format YYYY-MM-DD. :contentReference[oaicite:3]{index=3}
+ * GET /api/flights/search?depIata=MAA&arrIata=DEL&date=2026-02-11&adults=1&travelClass=ECONOMY&limit=20
  */
 export async function searchFlights(req, res) {
   try {
-    // ✅ accept both correct keys + old typo keys (from your frontend/netlify build)
-    const depIataRaw = req.query.depIata || req.query.deplata;
-    const arrIataRaw = req.query.arrIata || req.query.arrlata;
-
-    const {
-      date,
-      airlineIata,
-      flightNumber,
-      flightIata,
-      limit
-    } = req.query;
-
-    const depIata = (depIataRaw || "").trim().toUpperCase();
-    const arrIata = (arrIataRaw || "").trim().toUpperCase();
+    const { depIata, arrIata, date, adults, travelClass, limit } = req.query;
 
     if (!depIata || !arrIata) {
-      return bad(res, "depIata and arrIata are required (IATA codes)");
+      return bad(res, "depIata and arrIata are required");
     }
-
-    // ✅ normalize date to YYYY-MM-DD
-    let safeDate = undefined;
-    if (date) {
-      const d = String(date).trim();
-
-      // already YYYY-MM-DD
-      if (/^\d{4}-\d{2}-\d{2}$/.test(d)) safeDate = d;
-
-      // convert DD-MM-YYYY -> YYYY-MM-DD
-      else if (/^\d{2}-\d{2}-\d{4}$/.test(d)) {
-        const [dd, mm, yyyy] = d.split("-");
-        safeDate = `${yyyy}-${mm}-${dd}`;
-      }
+    if (!date) {
+      return bad(res, "date is required (YYYY-MM-DD) for Amadeus offers");
     }
 
     const query = {
-      dep_iata: depIata,
-      arr_iata: arrIata,
-      ...(safeDate ? { flight_date: safeDate } : {}),
-      ...(airlineIata ? { airline_iata: airlineIata } : {}),
-      ...(flightNumber ? { flight_number: flightNumber } : {}),
-      ...(flightIata ? { flight_iata: flightIata } : {}),
-      limit: Math.min(Number(limit || 50), 100),
+      originLocationCode: String(depIata).toUpperCase(),
+      destinationLocationCode: String(arrIata).toUpperCase(),
+      departureDate: String(date).slice(0, 10),
+      adults: Number(adults || 1),
+      travelClass: travelClass || "ECONOMY",
+      max: Math.min(Number(limit || 20), 50),
+      currencyCode: "INR",
     };
 
     const key = makeKey(query);
+    const cached = getCache(key);
+    if (cached) return ok(res, { fromCache: true, results: cached }, "Flights fetched (cache)");
 
-    // ✅ cache 5 min
-    const cached = await FlightCache.findOne({ key });
-    if (cached && cached.expiresAt > new Date()) {
-      return ok(res, { fromCache: true, results: cached.data.results }, "Flights fetched (cache)");
-    }
+    const amadeus = await getAmadeusClient();
+    const resp = await amadeus.get("/v2/shopping/flight-offers", query);
 
-    const apiData = await aviationstackFlights(query);
-    const results = normalizeFlights(apiData);
+    const offers = resp?.data?.data || [];
 
-    await FlightCache.findOneAndUpdate(
-      { key },
-      {
-        key,
-        query,
-        data: { results },
-        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
-      },
-      { upsert: true, new: true }
-    );
+    // normalize minimal fields for your frontend
+    const results = offers.map((o) => {
+      const firstIt = o?.itineraries?.[0];
+      const seg = firstIt?.segments?.[0];
 
+      return {
+        provider: "amadeus",
+        id: o.id,
+        price: {
+          total: o?.price?.total,
+          currency: o?.price?.currency,
+        },
+        airline: {
+          iata: seg?.carrierCode,
+          name: seg?.carrierCode, // you can map carrier to name later
+        },
+        flight: {
+          number: seg?.number,
+          iata: `${seg?.carrierCode}${seg?.number}`,
+        },
+        departure: {
+          iata: seg?.departure?.iataCode,
+          at: seg?.departure?.at,
+        },
+        arrival: {
+          iata: seg?.arrival?.iataCode,
+          at: seg?.arrival?.at,
+        },
+        cabin: travelClass || "ECONOMY",
+        raw: o,
+      };
+    });
+
+    setCache(key, results);
     return ok(res, { fromCache: false, results }, "Flights fetched");
   } catch (err) {
-    // ✅ show actual AviationStack message to frontend
-    const apiError = err?.response?.data;
-    const msg =
-      apiError?.error?.message ||
-      apiError?.message ||
-      err.message ||
-      "Flight search failed";
-
-    return bad(res, msg, { error: apiError || err.message });
+    return bad(res, "Flight search failed", {
+      error: err?.response?.data || err.message,
+    });
   }
 }
 
-
 /**
- * GET /api/flights/status?flightIata=AI202
- * Uses /v1/flights filters (flight_iata / flight_number etc.) :contentReference[oaicite:5]{index=5}
+ * GET /api/flights/status?carrierCode=AI&flightNumber=202&date=2026-02-11
  */
 export async function getFlightStatus(req, res) {
   try {
-    const { flightIata, flightNumber, date } = req.query;
-    if (!flightIata && !flightNumber) return bad(res, "flightIata or flightNumber required");
+    const { carrierCode, flightNumber, date } = req.query;
 
-    const query = {
-      ...(date ? { flight_date: date } : {}),
-      ...(flightIata ? { flight_iata: flightIata } : {}),
-      ...(flightNumber ? { flight_number: flightNumber } : {}),
-      limit: 10
-    };
+    if (!carrierCode || !flightNumber || !date) {
+      return bad(res, "carrierCode, flightNumber, date are required");
+    }
 
-    const apiData = await aviationstackFlights(query);
-    const results = normalizeFlights(apiData);
+    const amadeus = await getAmadeusClient();
+    const resp = await amadeus.get("/v2/schedule/flights", {
+      carrierCode,
+      flightNumber,
+      scheduledDepartureDate: String(date).slice(0, 10),
+    });
 
-    return ok(res, { results }, "Flight status fetched");
+    return ok(res, { results: resp?.data?.data || [] }, "Flight status fetched");
   } catch (err) {
-    return bad(res, "Flight status fetch failed", { error: err?.response?.data || err.message });
+    return bad(res, "Flight status fetch failed", {
+      error: err?.response?.data || err.message,
+    });
   }
 }
